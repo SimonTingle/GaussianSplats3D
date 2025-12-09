@@ -3,6 +3,7 @@ import sys
 import logging
 import uvicorn
 import torch
+from rembg import remove
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
@@ -10,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from PIL import Image
 from io import BytesIO
-from rembg import remove # Background removal
 
 # --- SETUP LOGGING ---
 logging.basicConfig(
@@ -24,8 +24,13 @@ PORT = 8080
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
 
+# Create directories if they don't exist
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 # Ensure Trellis is in python path
-sys.path.append(os.path.join(os.path.dirname(__file__), "TRELLIS"))
+# We use abspath to ensure it finds the folder even if run from a different dir
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "TRELLIS"))
 
 # --- GLOBAL MODEL STORE ---
 model_store = {
@@ -46,8 +51,22 @@ async def lifespan(app: FastAPI):
     try:
         from trellis.pipelines import TrellisImageTo3DPipeline
         
-        # Load Model (HuggingFace)
-        pipeline = TrellisImageTo3DPipeline.from_pretrained("JeffreyXiang/TRELLIS-image-large")
+        # --- FIXED SECTION START ---
+        # 1. Force absolute path to avoid ambiguity
+        checkpoint_path = os.path.abspath("ckpts")
+        
+        # 2. Check if path exists
+        if not os.path.exists(checkpoint_path):
+             logger.critical(f"❌ Checkpoint folder NOT FOUND at: {checkpoint_path}")
+             raise FileNotFoundError(f"Missing checkpoints at {checkpoint_path}")
+        else:
+             logger.info(f"📂 Loading weights from: {checkpoint_path}")
+
+        # 3. Load WITHOUT the problematic flag
+        # The absolute path 'checkpoint_path' is enough to force local loading
+        pipeline = TrellisImageTo3DPipeline.from_pretrained(checkpoint_path)
+        # --- FIXED SECTION END ---
+
         pipeline.cuda()
         
         model_store["pipeline"] = pipeline
@@ -56,10 +75,13 @@ async def lifespan(app: FastAPI):
         logger.critical(f"❌ Failed to import TRELLIS modules. Did you run setup_env.sh? Error: {e}")
     except Exception as e:
         logger.critical(f"❌ Failed to load Model Weights. Error: {e}")
+        # Print full trace for debugging
+        import traceback
+        traceback.print_exc()
         
     yield
     
-    # Cleanup (Optional)
+    # Cleanup
     logger.info("Shutting down...")
     if model_store["pipeline"]:
         del model_store["pipeline"]
@@ -68,7 +90,7 @@ async def lifespan(app: FastAPI):
 # --- APP INITIALIZATION ---
 app = FastAPI(title="Neural Splat API", lifespan=lifespan)
 
-# CORS (Allow Vercel frontend)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -79,12 +101,10 @@ app.add_middleware(
 
 def preprocess_image(image_path: str) -> Image.Image:
     """
-    Opens image and removes background using rembg.
-    TRELLIS requires RGBA with transparent background for best results.
+    Opens image and removes background.
     """
     try:
         img = Image.open(image_path).convert("RGBA")
-        # Remove background
         img_no_bg = remove(img)
         return img_no_bg
     except Exception as e:
@@ -110,7 +130,7 @@ async def generate_splat(file: UploadFile = File(...)):
         raise HTTPException(status_code=503, detail="Model is not loaded yet. Check server logs.")
 
     # 1. Validate File
-    if not file.content_type.startswith("image/"):
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
 
     # 2. Save Upload
@@ -123,7 +143,7 @@ async def generate_splat(file: UploadFile = File(...)):
         
         logger.info(f"Received image: {file.filename}")
 
-        # 3. Preprocess (Remove Background)
+        # 3. Preprocess
         logger.info("Removing background...")
         processed_image = preprocess_image(input_path)
 
@@ -138,7 +158,6 @@ async def generate_splat(file: UploadFile = File(...)):
         output_filename = f"splat_{file_id}.ply"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         
-        # Check available keys in output to find Gaussian data
         # Usually outputs['gaussian'][0] is the object
         if 'gaussian' in outputs and len(outputs['gaussian']) > 0:
             outputs['gaussian'][0].save_ply(output_path)
@@ -156,9 +175,12 @@ async def generate_splat(file: UploadFile = File(...)):
 
     except Exception as e:
         logger.error(f"Generation Error: {str(e)}")
+        # Print full trace to console for debugging
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
     finally:
-        # Cleanup input file to save space
+        # Cleanup input file
         if os.path.exists(input_path):
             os.remove(input_path)
 
