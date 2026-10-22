@@ -1,7 +1,7 @@
 fastapi==0.109.0
 uvicorn==0.27.0
 python-multipart==0.0.6
-pillow==10.2.0
+pillow==13.0.0
 numpy==1.26.3
 rembg==2.0.56
 onnxruntime-gpu; sys_platform == 'linux'
